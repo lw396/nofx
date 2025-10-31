@@ -108,7 +108,7 @@ func GetFullDecision(ctx *Context, mcpClient *mcp.Client) (*FullDecision, error)
 	}
 
 	// 4. 解析AI响应
-	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
+	decision, err := parseFullDecisionResponse(aiResponse, ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.BTCETHLeverage, ctx.AltcoinLeverage)
 	if err != nil {
 		return nil, fmt.Errorf("解析AI响应失败: %w", err)
 	}
@@ -254,8 +254,8 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("   - 针对**无持仓的币种**，或者不想对任何币种操作时\n\n")
 	sb.WriteString("**wait vs hold 使用说明**:\n")
 	sb.WriteString("- 有BTCUSDT持仓，趋势正常 → {\"symbol\": \"BTCUSDT\", \"action\": \"hold\"}\n")
-	sb.WriteString("- 无ETHUSDT持仓，观望不开 → 不输出ETHUSDT的决策（推荐），或输出wait\n")
-	sb.WriteString("- 如果本周期不想做任何操作 → 输出 [{\"symbol\": \"ANY\", \"action\": \"wait\", \"reasoning\": \"...\"}]\n\n")
+	sb.WriteString("- 无ETHUSDT持仓，观望不开 → 不输出ETHUSDT的决策（推荐）\n")
+	sb.WriteString("- 如果本周期不想做任何操作 → 输出空数组 [] 即可\n\n")
 
 	sb.WriteString("**持仓管理约束**:\n")
 	sb.WriteString("- ⚠️ 禁止金字塔加仓（每个币种最多1个持仓）\n")
@@ -299,7 +299,10 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- `stop_loss`: 精确止损价格（限制单笔损失1-3%账户价值）\n")
 	sb.WriteString("- `take_profit`: 精确止盈价格（基于技术阻力位/支撑位）\n")
 	sb.WriteString("- `confidence`: 信心度0-100（建议≥75才开仓）\n")
-	sb.WriteString("- `risk_usd`: 美元风险敞口 = |入场价 - 止损价| × 仓位 × 杠杆\n\n")
+	sb.WriteString("- `risk_usd`: 美元风险敞口（单笔最大可能亏损）\n")
+	sb.WriteString("  计算公式: risk_usd = (|入场价 - 止损价| / 入场价) × position_size_usd\n")
+	sb.WriteString("  示例: 入场价100k, 止损98k, 仓位5000U → risk_usd = (2k/100k) × 5000 = 100U\n")
+	sb.WriteString("  要求: risk_usd ≤ 账户净值的10%（严格遵守）\n\n")
 	sb.WriteString("**止损止盈设置方法论**:\n")
 	sb.WriteString("1. **基于ATR动态止损**: 止损距离 = 当前价格 ± (1.5~2.0 × ATR)\n")
 	sb.WriteString("   - 高波动市场（ATR大）→ 使用2.0倍ATR\n")
@@ -725,7 +728,7 @@ func buildUserPrompt(ctx *Context) string {
 }
 
 // parseFullDecisionResponse 解析AI的完整决策响应
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) (*FullDecision, error) {
 	// 1. 提取思维链
 	cotTrace := extractCoTTrace(aiResponse)
 
@@ -739,7 +742,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 	}
 
 	// 3. 验证决策
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+	if err := validateDecisions(decisions, accountEquity, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -807,9 +810,9 @@ func fixMissingQuotes(jsonStr string) string {
 }
 
 // validateDecisions 验证所有决策（需要账户信息和杠杆配置）
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecisions(decisions []Decision, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
 	for i, decision := range decisions {
-		if err := validateDecision(&decision, accountEquity, btcEthLeverage, altcoinLeverage); err != nil {
+		if err := validateDecision(&decision, accountEquity, availableBalance, btcEthLeverage, altcoinLeverage); err != nil {
 			return fmt.Errorf("决策 #%d 验证失败: %w", i+1, err)
 		}
 	}
@@ -839,7 +842,7 @@ func findMatchingBracket(s string, start int) int {
 }
 
 // validateDecision 验证单个决策的有效性
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int) error {
+func validateDecision(d *Decision, accountEquity, availableBalance float64, btcEthLeverage, altcoinLeverage int) error {
 	// 验证action
 	validActions := map[string]bool{
 		"open_long":   true,
@@ -884,6 +887,20 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		// 验证信心度是否达到建议阈值
 		if d.Confidence < 75 {
 			return fmt.Errorf("信心度过低(%d)，建议≥75才开仓，当前信号强度不足", d.Confidence)
+		}
+
+		// ⚠️ 验证保证金约束（硬性约束）
+		// 所需保证金 = 仓位价值 / 杠杆
+		requiredMargin := d.PositionSizeUSD / float64(d.Leverage)
+		if requiredMargin > availableBalance {
+			return fmt.Errorf("保证金不足: 需要%.2f U，可用%.2f U [仓位%.2f ÷ 杠杆%d = %.2f]",
+				requiredMargin, availableBalance, d.PositionSizeUSD, d.Leverage, requiredMargin)
+		}
+
+		// 额外建议：保证金使用率不要超过90%（留有余地）
+		marginUsagePercent := (requiredMargin / availableBalance) * 100
+		if marginUsagePercent > 90 {
+			log.Printf("⚠️  保证金使用率较高(%.1f%%)，建议控制在90%%以内 [%s]", marginUsagePercent, d.Symbol)
 		}
 
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
@@ -931,25 +948,50 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 		}
 
+		// 计算风险回报比
 		var riskPercent, rewardPercent, riskRewardRatio float64
 		if d.Action == "open_long" {
 			riskPercent = (entryPrice - d.StopLoss) / entryPrice * 100
 			rewardPercent = (d.TakeProfit - entryPrice) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
 		} else {
 			riskPercent = (d.StopLoss - entryPrice) / entryPrice * 100
 			rewardPercent = (entryPrice - d.TakeProfit) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
 		}
+
+		// 验证风险和收益都必须大于0
+		if riskPercent <= 0 {
+			return fmt.Errorf("风险为零或负数(%.2f%%)，止损设置异常 [入场价:%.2f 止损:%.2f]",
+				riskPercent, entryPrice, d.StopLoss)
+		}
+		if rewardPercent <= 0 {
+			return fmt.Errorf("收益为零或负数(%.2f%%)，止盈设置异常 [入场价:%.2f 止盈:%.2f]",
+				rewardPercent, entryPrice, d.TakeProfit)
+		}
+
+		// 计算风险回报比
+		riskRewardRatio = rewardPercent / riskPercent
 
 		// 硬约束：风险回报比必须≥3.0
 		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [止损:%.2f 止盈:%.2f]",
-				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
+			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥3.0:1 [风险:%.2f%% 收益:%.2f%%] [入场:%.2f 止损:%.2f 止盈:%.2f]",
+				riskRewardRatio, riskPercent, rewardPercent, entryPrice, d.StopLoss, d.TakeProfit)
+		}
+
+		// 验证risk_usd字段的合理性（如果AI提供了）
+		if d.RiskUSD > 0 {
+			// risk_usd不应该超过账户净值的10%（单笔最大风险）
+			maxRiskUSD := accountEquity * 0.10
+			if d.RiskUSD > maxRiskUSD {
+				return fmt.Errorf("单笔风险过大(%.2f USD)，不应超过账户净值的10%%(%.2f USD)",
+					d.RiskUSD, maxRiskUSD)
+			}
+
+			// 验证risk_usd计算是否合理（应该约等于止损距离 × 仓位价值 / 入场价）
+			expectedRiskUSD := riskPercent / 100 * d.PositionSizeUSD
+			if d.RiskUSD > expectedRiskUSD*1.5 || d.RiskUSD < expectedRiskUSD*0.5 {
+				// 允许50%误差范围
+				log.Printf("⚠️  risk_usd(%.2f)与计算值(%.2f)偏差较大，请检查", d.RiskUSD, expectedRiskUSD)
+			}
 		}
 	}
 
