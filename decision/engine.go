@@ -74,6 +74,7 @@ type Decision struct {
 	Action          string  `json:"action"` // "open_long", "open_short", "close_long", "close_short", "hold", "wait"
 	Leverage        int     `json:"leverage,omitempty"`
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
+	EntryPrice      float64 `json:"entry_price,omitempty"` // 预期入场价格（用于风险回报比计算）
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
 	Confidence      int     `json:"confidence,omitempty"` // 信心度 (0-100)
@@ -541,13 +542,14 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("简洁分析你的思考过程（最多500字）\n\n")
 	sb.WriteString("**第二步: 返回有效的JSON决策数组**\n\n")
 	sb.WriteString("```json\n[\n")
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*5))
+	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"entry_price\": 95500, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"下跌趋势+MACD死叉\"},\n", btcEthLeverage, accountEquity*5))
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\", \"reasoning\": \"止盈离场\"}\n")
 	sb.WriteString("]\n```\n\n")
 	sb.WriteString("**字段说明**:\n")
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString("- `confidence`: 0-100（开仓建议≥75）\n")
-	sb.WriteString("- 开仓时必填: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd, reasoning\n")
+	sb.WriteString("- 开仓时必填: leverage, position_size_usd, **entry_price**, stop_loss, take_profit, confidence, risk_usd, reasoning\n")
+	sb.WriteString("- `entry_price`: **预期入场价格**（推荐使用当前市价，用于精确计算风险回报比）\n")
 	sb.WriteString("- 所有数值字段必须是正数（除非action是hold/wait）\n")
 	sb.WriteString("- 做多时: profit_target > 入场价, stop_loss < 入场价\n")
 	sb.WriteString("- 做空时: profit_target < 入场价, stop_loss > 入场价\n\n")
@@ -866,8 +868,24 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		if d.PositionSizeUSD <= 0 {
 			return fmt.Errorf("仓位大小必须大于0: %.2f", d.PositionSizeUSD)
 		}
-		// 注意：仓位价值上限由可用保证金自然限制，不需要额外硬编码限制
-		// 实际开仓时会检查：position_size_usd / leverage ≤ available_balance
+
+		// 验证最小仓位：至少为账户净值的5%（避免手续费占比过高）
+		minPositionSize := accountEquity * 0.05
+		if d.PositionSizeUSD < minPositionSize {
+			return fmt.Errorf("仓位过小(%.2f USD)，建议至少为账户净值的5%%(%.2f USD)，否则手续费占比过高",
+				d.PositionSizeUSD, minPositionSize)
+		}
+
+		// 验证信心度范围：必须在0-100之间
+		if d.Confidence < 0 || d.Confidence > 100 {
+			return fmt.Errorf("信心度必须在0-100之间: %d", d.Confidence)
+		}
+
+		// 验证信心度是否达到建议阈值
+		if d.Confidence < 75 {
+			return fmt.Errorf("信心度过低(%d)，建议≥75才开仓，当前信号强度不足", d.Confidence)
+		}
+
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
 			return fmt.Errorf("止损和止盈必须大于0")
 		}
@@ -884,15 +902,33 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		}
 
 		// 验证风险回报比（必须≥1:3）
-		// 计算估算入场价：使用止损和止盈之间靠近止损侧的位置（1/4位置）
-		// 这样可以更真实地反映实际交易场景
+		// 优先使用AI提供的entry_price，如果没有则估算
 		var entryPrice float64
-		if d.Action == "open_long" {
-			// 做多：入场价在止损之上，接近止损（距离止损约25%）
-			entryPrice = d.StopLoss + (d.TakeProfit-d.StopLoss)*0.25
+		if d.EntryPrice > 0 {
+			// 使用AI提供的预期入场价
+			entryPrice = d.EntryPrice
 		} else {
-			// 做空：入场价在止损之下，接近止损（距离止损约25%）
-			entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.25
+			// 如果AI未提供entry_price，使用止损和止盈之间靠近止损侧的位置（1/4位置）估算
+			if d.Action == "open_long" {
+				// 做多：入场价在止损之上，接近止损（距离止损约25%）
+				entryPrice = d.StopLoss + (d.TakeProfit-d.StopLoss)*0.25
+			} else {
+				// 做空：入场价在止损之下，接近止损（距离止损约25%）
+				entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.25
+			}
+		}
+
+		// 验证entry_price的合理性
+		if d.Action == "open_long" {
+			if entryPrice <= d.StopLoss || entryPrice >= d.TakeProfit {
+				return fmt.Errorf("做多时入场价必须在止损和止盈之间: 入场价%.2f 止损%.2f 止盈%.2f",
+					entryPrice, d.StopLoss, d.TakeProfit)
+			}
+		} else {
+			if entryPrice >= d.StopLoss || entryPrice <= d.TakeProfit {
+				return fmt.Errorf("做空时入场价必须在止损和止盈之间: 入场价%.2f 止损%.2f 止盈%.2f",
+					entryPrice, d.StopLoss, d.TakeProfit)
+			}
 		}
 
 		var riskPercent, rewardPercent, riskRewardRatio float64
