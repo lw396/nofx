@@ -269,7 +269,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 
 	// === 硬约束（风险控制）===
 	sb.WriteString("# ⚖️ 风险管理协议（强制执行）\n\n")
-	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:2（冒1%风险，赚2%+收益）\n")
+	sb.WriteString("1. **风险回报比**: 必须 ≥ 1:1.5（冒1%风险，赚1.5%+收益）\n")
 	sb.WriteString("2. **最多持仓**: 3个币种（质量>数量）\n")
 	sb.WriteString("3. **单币仓位范围**: \n")
 	sb.WriteString("   - **最小仓位**: ≥ 账户净值的5%（避免手续费占比过高）\n")
@@ -299,10 +299,11 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- `stop_loss`: 精确止损价格（限制单笔损失1-3%账户价值）\n")
 	sb.WriteString("- `take_profit`: 精确止盈价格（基于技术阻力位/支撑位）\n")
 	sb.WriteString("- `confidence`: 信心度0-100（建议≥75才开仓）\n")
-	sb.WriteString("- `risk_usd`: 美元风险敞口（单笔最大可能亏损）\n")
+	sb.WriteString("- `risk_usd`: 美元风险敞口（单笔最大可能亏损，不能超过账户净值的30%）\n")
 	sb.WriteString("  计算公式: risk_usd = (|入场价 - 止损价| / 入场价) × position_size_usd\n")
 	sb.WriteString("  示例: 入场价100k, 止损98k, 仓位5000U → risk_usd = (2k/100k) × 5000 = 100U\n")
-	sb.WriteString("  要求: risk_usd ≤ 账户净值的10%（严格遵守）\n\n")
+	sb.WriteString(fmt.Sprintf("  ⚠️ 当前账户净值%.2f，单笔风险不能超过%.2f USD\n", accountEquity, accountEquity*0.30))
+	sb.WriteString("  要求: risk_usd ≤ 账户净值的30%（严格遵守）\n\n")
 	sb.WriteString("**止损止盈设置方法论**:\n")
 	sb.WriteString("1. **基于ATR动态止损**: 止损距离 = 当前价格 ± (1.5~2.0 × ATR)\n")
 	sb.WriteString("   - 高波动市场（ATR大）→ 使用2.0倍ATR\n")
@@ -508,7 +509,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("**第6步：计算仓位和风险**\n")
 	sb.WriteString("- 仓位大小：账户净值的10-30%\n")
 	sb.WriteString("- 验证保证金：position_size_usd ÷ leverage ≤ available_balance\n")
-	sb.WriteString("- 验证风险回报比：基于当前市价，确保 ≥ 3.0\n")
+	sb.WriteString("- 验证风险回报比：基于当前市价，确保 ≥ 1.5\n")
 	sb.WriteString("- 设置合理止损（基于ATR或技术位）\n\n")
 	sb.WriteString("**第7步：输出决策**\n")
 	sb.WriteString("- 思维链分析（简洁，最多500字）\n")
@@ -588,7 +589,7 @@ func buildSystemPrompt(accountEquity float64, btcEthLeverage, altcoinLeverage in
 	sb.WriteString("- 目标是夏普比率，不是交易频率\n")
 	sb.WriteString("- 做空 = 做多，都是赚钱工具\n")
 	sb.WriteString("- 宁可错过，不做低质量交易\n")
-	sb.WriteString("- 风险回报比1:2是底线\n\n")
+	sb.WriteString("- 风险回报比1:1.5是底线\n\n")
 
 	sb.WriteString("现在，分析下方提供的市场数据并做出你的交易决策。\n")
 
@@ -918,7 +919,7 @@ func validateDecision(d *Decision, accountEquity, availableBalance float64, btcE
 			}
 		}
 
-		// 验证风险回报比（必须≥1:3）
+		// 验证风险回报比（必须≥1:1.5）
 		// 优先使用AI提供的entry_price，如果没有则估算
 		var entryPrice float64
 		if d.EntryPrice > 0 {
@@ -971,18 +972,18 @@ func validateDecision(d *Decision, accountEquity, availableBalance float64, btcE
 		// 计算风险回报比
 		riskRewardRatio = rewardPercent / riskPercent
 
-		// 硬约束：风险回报比必须≥2.0
-		if riskRewardRatio < 2.0 {
-			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥2.0:1 [风险:%.2f%% 收益:%.2f%%] [入场:%.2f 止损:%.2f 止盈:%.2f]",
+		// 硬约束：风险回报比必须≥1.5
+		if riskRewardRatio < 1.5 {
+			return fmt.Errorf("风险回报比过低(%.2f:1)，必须≥1.5:1 [风险:%.2f%% 收益:%.2f%%] [入场:%.2f 止损:%.2f 止盈:%.2f]",
 				riskRewardRatio, riskPercent, rewardPercent, entryPrice, d.StopLoss, d.TakeProfit)
 		}
 
 		// 验证risk_usd字段的合理性（如果AI提供了）
 		if d.RiskUSD > 0 {
-			// risk_usd不应该超过账户净值的10%（单笔最大风险）
-			maxRiskUSD := accountEquity * 0.10
+			// risk_usd不应该超过账户净值的30%（单笔最大风险）
+			maxRiskUSD := accountEquity * 0.30
 			if d.RiskUSD > maxRiskUSD {
-				return fmt.Errorf("单笔风险过大(%.2f USD)，不应超过账户净值的10%%(%.2f USD)",
+				return fmt.Errorf("单笔风险过大(%.2f USD)，不应超过账户净值的30%%(%.2f USD)",
 					d.RiskUSD, maxRiskUSD)
 			}
 
